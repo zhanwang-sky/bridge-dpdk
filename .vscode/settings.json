@@ -1,0 +1,12 @@
+{
+    "files.associations": {
+        "rte_launch.h": "c",
+        "rte_memory.h": "c",
+        "rte_common.h": "c",
+        "rte_eal.h": "c",
+        "stdio.h": "c",
+        "vector": "cpp",
+        "rte_debug.h": "c",
+        "rte_lcore.h": "c"
+    }
+}
