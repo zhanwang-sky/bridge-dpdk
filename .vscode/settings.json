@@ -7,6 +7,9 @@
         "stdio.h": "c",
         "rte_debug.h": "c",
         "rte_lcore.h": "c",
-        "rte_errno.h": "c"
+        "rte_errno.h": "c",
+        "typeinfo": "c",
+        "eal_internal_cfg.h": "c",
+        "eal_private.h": "c"
     }
 }
