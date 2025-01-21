@@ -5,8 +5,8 @@
         "rte_common.h": "c",
         "rte_eal.h": "c",
         "stdio.h": "c",
-        "vector": "cpp",
         "rte_debug.h": "c",
-        "rte_lcore.h": "c"
+        "rte_lcore.h": "c",
+        "rte_errno.h": "c"
     }
 }
