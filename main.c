@@ -57,8 +57,10 @@ int port_init(uint16_t port_id, app_port_t* app_port) {
     }
 
     printf("=== port[%hu] info:\n"
-           "dev_socket_id: %d\n"
+           "name: %s\n"
+           "bus_info: %s\n"
            "driver: %s\n"
+           "dev_socket_id: %d\n"
            "min_mtu: %hu\n"
            "max_mtu: %hu\n"
            "max_rx_queues: %hu\n"
@@ -68,8 +70,10 @@ int port_init(uint16_t port_id, app_port_t* app_port) {
            "rx_offload_capa: %08lx\n"
            "tx_offload_capa: %08lx\n",
            port_id,
-           dev_socket_id,
+           rte_dev_name(dev_info.device),
+           rte_dev_bus_info(dev_info.device),
            dev_info.driver_name,
+           dev_socket_id,
            dev_info.min_mtu,
            dev_info.max_mtu,
            dev_info.max_rx_queues,
@@ -79,7 +83,7 @@ int port_init(uint16_t port_id, app_port_t* app_port) {
            dev_info.rx_offload_capa,
            dev_info.tx_offload_capa);
 
-    mempool = rte_pktmbuf_pool_create("balabala",
+    mempool = rte_pktmbuf_pool_create(rte_dev_name(dev_info.device),
                                       NUM_MBUFS, MBUF_CACHE_SIZE,
                                       0, RTE_MBUF_DEFAULT_BUF_SIZE,
                                       dev_socket_id);
