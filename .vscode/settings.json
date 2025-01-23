@@ -10,6 +10,7 @@
         "rte_errno.h": "c",
         "typeinfo": "c",
         "eal_internal_cfg.h": "c",
-        "eal_private.h": "c"
+        "eal_private.h": "c",
+        "rte_cycles.h": "c"
     }
 }

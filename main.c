@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include <rte_common.h>
+#include <rte_cycles.h>
 #include <rte_debug.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
@@ -20,7 +21,8 @@
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 #define NUM_MBUFS 8192
-#define MBUF_CACHE_SIZE 512
+#define MBUF_CACHE_SIZE 256
+#define BURST_SIZE 32
 
 typedef struct {
     uint16_t port_id;
@@ -141,6 +143,35 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     return app_port;
 }
 
+static __rte_noreturn void
+app_main_loop(__rte_unused void *arg) {
+    uint64_t timer_hz;
+    uint64_t prev_cycles;
+    uint64_t curr_cycles;
+    uint64_t pkts_per_sec;
+    struct rte_mbuf* rx_pkts[BURST_SIZE];
+    uint16_t nb_rx;
+
+    timer_hz = rte_get_timer_hz();
+    prev_cycles = rte_get_timer_cycles();
+    pkts_per_sec = 0;
+
+    for (;;) {
+        nb_rx = rte_eth_rx_burst(app_cfg.app_port->port_id, 0, rx_pkts, BURST_SIZE);
+        for (uint16_t i = 0; i != nb_rx; ++i) {
+            rte_pktmbuf_free(rx_pkts[i]);
+        }
+        pkts_per_sec += nb_rx;
+
+        curr_cycles = rte_get_timer_cycles();
+        if (curr_cycles - prev_cycles > timer_hz) {
+            RTE_LOG(INFO, USER1, "%lu pkt/s\n", pkts_per_sec);
+            prev_cycles = curr_cycles;
+            pkts_per_sec = 0;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     int rc;
     unsigned nr_lcores;
@@ -183,8 +214,7 @@ int main(int argc, char* argv[]) {
         rte_exit(EXIT_FAILURE, "There is no app port initialized.\n");
     }
 
-    RTE_LOG(INFO, USER1, "Press any key to continue...\n");
-    getchar();
+    app_main_loop(NULL);
 
     rc = rte_eal_cleanup();
     if (rc < 0) {
