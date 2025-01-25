@@ -8,8 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include <unistd.h>
-
 #include <rte_arp.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
@@ -170,50 +168,115 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     return app_port;
 }
 
-int app_simple_reply(app_port_t* app_port, struct rte_mbuf* mbuf) {
-    struct rte_ether_hdr* eth_h;
+static inline int
+app_arp_process(app_port_t* app_port, struct rte_mbuf* mbuf,
+                struct rte_ether_hdr* eth_h,
+                struct rte_arp_hdr* arp_h) {
+    // length check
+    if (mbuf->nb_segs > 1) {
+        return 0; // unexpected segments
+    }
+    // ARP header check
+    if ((rte_be_to_cpu_16(arp_h->arp_hardware) != RTE_ARP_HRD_ETHER) ||
+        (rte_be_to_cpu_16(arp_h->arp_protocol) != RTE_ETHER_TYPE_IPV4) ||
+        (arp_h->arp_hlen != RTE_ETHER_ADDR_LEN) ||
+        (arp_h->arp_plen != sizeof(uint32_t)) ||
+        (rte_be_to_cpu_16(arp_h->arp_opcode) != RTE_ARP_OP_REQUEST)) {
+        return 0;
+    }
+    // ARP data check
+    if ((!rte_is_unicast_ether_addr(&arp_h->arp_data.arp_sha)) ||
+        (arp_h->arp_data.arp_sip == 0xffffffff) ||
+        ((!rte_is_same_ether_addr(&arp_h->arp_data.arp_tha, &app_port->mac_addr)) &&
+         (rte_be_to_cpu_32(arp_h->arp_data.arp_tip) != app_port->ip_addr))) {
+        return 0;
+    }
+
+    // ARP
+    arp_h->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+    rte_ether_addr_copy(&arp_h->arp_data.arp_sha, &arp_h->arp_data.arp_tha);
+    arp_h->arp_data.arp_tip = arp_h->arp_data.arp_sip;
+    rte_ether_addr_copy(&app_port->mac_addr, &arp_h->arp_data.arp_sha);
+    arp_h->arp_data.arp_sip = rte_cpu_to_be_32(app_port->ip_addr);
+    // ether
+    rte_ether_addr_copy(&eth_h->src_addr, &eth_h->dst_addr);
+    rte_ether_addr_copy(&app_port->mac_addr, &eth_h->src_addr);
+    // mbuf
+    mbuf->pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+    mbuf->data_len = mbuf->pkt_len;
+
+    return 1;
+}
+
+static inline int
+app_icmp_process(app_port_t* app_port, __rte_unused struct rte_mbuf* mbuf,
+                 struct rte_ether_hdr* eth_h,
+                 struct rte_ipv4_hdr* ipv4_h,
+                 struct rte_icmp_hdr* icmp_h) {
+    uint32_t cksum;
+
+    // ICMP header check
+    if ((icmp_h->icmp_type != RTE_ICMP_TYPE_ECHO_REQUEST) ||
+        (icmp_h->icmp_code != 0)) {
+        return 0;
+    }
+
+    // ICMP
+    icmp_h->icmp_type = RTE_ICMP_TYPE_ECHO_REPLY;
+    cksum = ~icmp_h->icmp_cksum & 0xffff;
+    cksum += ~rte_cpu_to_be_16(RTE_ICMP_TYPE_ECHO_REQUEST << 8) & 0xffff;
+    cksum += rte_cpu_to_be_16(RTE_ICMP_TYPE_ECHO_REPLY << 8);
+    cksum = (cksum & 0xffff) + (cksum >> 16);
+    cksum = (cksum & 0xffff) + (cksum >> 16);
+    icmp_h->icmp_cksum = ~cksum;
+    // IPv4
+    ipv4_h->dst_addr = ipv4_h->src_addr;
+    ipv4_h->src_addr = rte_cpu_to_be_32(app_port->ip_addr);
+    // ether
+    rte_ether_addr_copy(&eth_h->src_addr, &eth_h->dst_addr);
+    rte_ether_addr_copy(&app_port->mac_addr, &eth_h->src_addr);
+
+    return 1;
+}
+
+static inline int
+app_ipv4_process(app_port_t* app_port, struct rte_mbuf* mbuf,
+                 struct rte_ether_hdr* eth_h,
+                 struct rte_ipv4_hdr* ipv4_h) {
+    // IPv4 header check
+    if ((ipv4_h->ihl != 5) ||
+        ((rte_be_to_cpu_16(ipv4_h->fragment_offset) & 0x3fff) != 0) ||
+        (ipv4_h->time_to_live == 0) ||
+        (ipv4_h->src_addr == 0) ||
+        (rte_be_to_cpu_32(ipv4_h->dst_addr) != app_port->ip_addr)) {
+        return 0;
+    }
+
+    if (ipv4_h->next_proto_id == IPPROTO_ICMP) {
+        struct rte_icmp_hdr* icmp_h = (struct rte_icmp_hdr*) ((char*) ipv4_h + sizeof(*ipv4_h));
+        return app_icmp_process(app_port, mbuf, eth_h, ipv4_h, icmp_h);
+    }
+
+    return 0;
+}
+
+static inline int
+app_pkt_process(app_port_t* app_port, struct rte_mbuf* mbuf) {
+    struct rte_ether_hdr* eth_h = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
     uint16_t ether_type;
 
-    eth_h = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
-    ether_type = rte_be_to_cpu_16(eth_h->ether_type);
-
-    // sanity check
+    // ether header check
     if (!rte_is_unicast_ether_addr(&eth_h->src_addr)) {
         return 0;
     }
 
+    ether_type = rte_be_to_cpu_16(eth_h->ether_type);
     if (ether_type == RTE_ETHER_TYPE_ARP) {
-        struct rte_arp_hdr* arp_h;
-        arp_h = rte_pktmbuf_mtod_offset(mbuf, struct rte_arp_hdr*, sizeof(struct rte_ether_hdr));
-        // length check
-        if (mbuf->nb_segs > 1) {
-            // unexpected segments
-            return 0;
-        }
-        // arp check
-        if ((arp_h->arp_hardware != rte_cpu_to_be_16(RTE_ARP_HRD_ETHER)) ||
-            (arp_h->arp_protocol != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) ||
-            (arp_h->arp_hlen != RTE_ETHER_ADDR_LEN) ||
-            (arp_h->arp_plen != sizeof(uint32_t)) ||
-            (arp_h->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) ||
-            !rte_is_unicast_ether_addr(&arp_h->arp_data.arp_sha) ||
-            ((!rte_is_same_ether_addr(&arp_h->arp_data.arp_tha, &app_port->mac_addr)) &&
-             (arp_h->arp_data.arp_tip != rte_cpu_to_be_32(app_port->ip_addr)))) {
-            return 0;
-        }
-        // arp
-        arp_h->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
-        rte_ether_addr_copy(&arp_h->arp_data.arp_sha, &arp_h->arp_data.arp_tha);
-        arp_h->arp_data.arp_tip = arp_h->arp_data.arp_sip;
-        rte_ether_addr_copy(&app_port->mac_addr, &arp_h->arp_data.arp_sha);
-        arp_h->arp_data.arp_sip = rte_cpu_to_be_32(app_port->ip_addr);
-        // ether
-        rte_ether_addr_copy(&eth_h->src_addr, &eth_h->dst_addr);
-        rte_ether_addr_copy(&app_port->mac_addr, &eth_h->src_addr);
-        // mbuf
-        mbuf->pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
-        mbuf->data_len = mbuf->pkt_len;
-        return 1;
+        struct rte_arp_hdr* arp_h = (struct rte_arp_hdr*) ((char*) eth_h + sizeof(*eth_h));
+        return app_arp_process(app_port, mbuf, eth_h, arp_h);
+    } else if (ether_type == RTE_ETHER_TYPE_IPV4) {
+        struct rte_ipv4_hdr* ipv4_h = (struct rte_ipv4_hdr*) ((char*) eth_h + sizeof(*eth_h));
+        return app_ipv4_process(app_port, mbuf, eth_h, ipv4_h);
     }
 
     return 0;
@@ -290,7 +353,7 @@ app_main_loop(void *arg) {
             if (likely(i < nb_rx - 1)) {
                 rte_prefetch0(rte_pktmbuf_mtod(mbufs[i + 1], void*));
             }
-            if (!app_simple_reply(app_port, mbufs[i])) {
+            if (!app_pkt_process(app_port, mbufs[i])) {
                 rte_pktmbuf_free(mbufs[i]);
                 continue;
             }
@@ -308,7 +371,7 @@ app_main_loop(void *arg) {
             }
         }
 
-        rte_delay_us_sleep(1);
+        // rte_delay_us_sleep(1);
     }
 }
 
