@@ -21,6 +21,7 @@
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
+#include <rte_prefetch.h>
 #include <rte_spinlock.h>
 
 #define RX_RING_SIZE 1024
@@ -33,7 +34,7 @@ typedef struct {
     uint16_t port_id;
     int dev_socket_id;
     struct rte_ether_addr mac_addr;
-    rte_be32_t ip_addr;
+    uint32_t ip_addr;
 } app_port_t;
 
 typedef struct {
@@ -169,6 +170,55 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     return app_port;
 }
 
+int app_simple_reply(app_port_t* app_port, struct rte_mbuf* mbuf) {
+    struct rte_ether_hdr* eth_h;
+    uint16_t ether_type;
+
+    eth_h = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
+    ether_type = rte_be_to_cpu_16(eth_h->ether_type);
+
+    // sanity check
+    if (!rte_is_unicast_ether_addr(&eth_h->src_addr)) {
+        return 0;
+    }
+
+    if (ether_type == RTE_ETHER_TYPE_ARP) {
+        struct rte_arp_hdr* arp_h;
+        arp_h = rte_pktmbuf_mtod_offset(mbuf, struct rte_arp_hdr*, sizeof(struct rte_ether_hdr));
+        // length check
+        if (mbuf->nb_segs > 1) {
+            // unexpected segments
+            return 0;
+        }
+        // arp check
+        if ((arp_h->arp_hardware != rte_cpu_to_be_16(RTE_ARP_HRD_ETHER)) ||
+            (arp_h->arp_protocol != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) ||
+            (arp_h->arp_hlen != RTE_ETHER_ADDR_LEN) ||
+            (arp_h->arp_plen != sizeof(uint32_t)) ||
+            (arp_h->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) ||
+            !rte_is_unicast_ether_addr(&arp_h->arp_data.arp_sha) ||
+            ((!rte_is_same_ether_addr(&arp_h->arp_data.arp_tha, &app_port->mac_addr)) &&
+             (arp_h->arp_data.arp_tip != rte_cpu_to_be_32(app_port->ip_addr)))) {
+            return 0;
+        }
+        // arp
+        arp_h->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+        rte_ether_addr_copy(&arp_h->arp_data.arp_sha, &arp_h->arp_data.arp_tha);
+        arp_h->arp_data.arp_tip = arp_h->arp_data.arp_sip;
+        rte_ether_addr_copy(&app_port->mac_addr, &arp_h->arp_data.arp_sha);
+        arp_h->arp_data.arp_sip = rte_cpu_to_be_32(app_port->ip_addr);
+        // ether
+        rte_ether_addr_copy(&eth_h->src_addr, &eth_h->dst_addr);
+        rte_ether_addr_copy(&app_port->mac_addr, &eth_h->src_addr);
+        // mbuf
+        mbuf->pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+        mbuf->data_len = mbuf->pkt_len;
+        return 1;
+    }
+
+    return 0;
+}
+
 static int
 app_second_loop(__rte_unused void *arg) {
     app_config_t* app_cfg = (app_config_t*) arg;
@@ -177,8 +227,7 @@ app_second_loop(__rte_unused void *arg) {
     struct rte_ether_hdr* eth_h;
     struct rte_arp_hdr* arp_h;
 
-    RTE_LOG(INFO, USER1, ">>> Launching second loop on lcore %u\n",
-            rte_lcore_id());
+    RTE_LOG(INFO, USER1, ">>> Launching second loop on lcore %u\n", rte_lcore_id());
 
     for (;;) {
         mbuf = rte_pktmbuf_alloc(app_cfg->mbuf_pool);
@@ -201,9 +250,9 @@ app_second_loop(__rte_unused void *arg) {
         arp_h->arp_plen = sizeof(uint32_t);
         arp_h->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REQUEST);
         rte_ether_addr_copy(&app_port->mac_addr, &arp_h->arp_data.arp_sha);
-        arp_h->arp_data.arp_sip = app_port->ip_addr;
+        arp_h->arp_data.arp_sip = rte_cpu_to_be_32(app_port->ip_addr);
         rte_ether_unformat_addr("FF:FF:FF:FF:FF:FF", &arp_h->arp_data.arp_tha);
-        arp_h->arp_data.arp_tip = app_port->ip_addr;
+        arp_h->arp_data.arp_tip = arp_h->arp_data.arp_sip;
 
         rte_spinlock_lock(&app_cfg->tx_lock);
         do {
@@ -225,32 +274,38 @@ app_second_loop(__rte_unused void *arg) {
 static __rte_noreturn void
 app_main_loop(void *arg) {
     app_config_t* app_cfg = (app_config_t*) arg;
-    uint64_t timer_hz;
-    uint64_t prev_cycles;
-    uint64_t curr_cycles;
-    uint64_t pkts_per_sec;
-    struct rte_mbuf* rx_pkts[BURST_SIZE];
+    app_port_t* app_port = app_cfg->app_port;
+    struct rte_mbuf* mbufs[BURST_SIZE];
     uint16_t nb_rx;
+    uint16_t nb_tx;
 
-    RTE_LOG(INFO, USER1, ">>> Launching main loop on lcore %u\n",
-            rte_lcore_id());
-
-    timer_hz = rte_get_timer_hz();
-    prev_cycles = rte_get_timer_cycles();
-    pkts_per_sec = 0;
+    RTE_LOG(INFO, USER1, ">>> Launching main loop on lcore %u\n", rte_lcore_id());
 
     for (;;) {
-        nb_rx = rte_eth_rx_burst(app_cfg->app_port->port_id, 0, rx_pkts, BURST_SIZE);
-        for (uint16_t i = 0; i != nb_rx; ++i) {
-            rte_pktmbuf_free(rx_pkts[i]);
-        }
-        pkts_per_sec += nb_rx;
+        nb_rx = rte_eth_rx_burst(app_cfg->app_port->port_id, 0, mbufs, BURST_SIZE);
+        nb_tx = 0;
 
-        curr_cycles = rte_get_timer_cycles();
-        if (curr_cycles - prev_cycles > timer_hz) {
-            RTE_LOG(INFO, USER1, "%lu pkt/s\n", pkts_per_sec);
-            prev_cycles = curr_cycles;
-            pkts_per_sec = 0;
+        // process received
+        for (uint16_t i = 0; i != nb_rx; ++i) {
+            if (likely(i < nb_rx - 1)) {
+                rte_prefetch0(rte_pktmbuf_mtod(mbufs[i + 1], void*));
+            }
+            if (!app_simple_reply(app_port, mbufs[i])) {
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+            mbufs[nb_tx++] = mbufs[i];
+        }
+
+        // send reply
+        if (nb_tx > 0) {
+            uint16_t nb_sent;
+            rte_spinlock_lock(&app_cfg->tx_lock);
+            nb_sent = rte_eth_tx_burst(app_port->port_id, 0, mbufs, nb_tx);
+            rte_spinlock_unlock(&app_cfg->tx_lock);
+            for (uint16_t i = nb_sent; i != nb_tx; ++i) {
+                rte_pktmbuf_free(mbufs[i]);
+            }
         }
 
         rte_delay_us_sleep(1);
@@ -303,10 +358,10 @@ int main(int argc, char* argv[]) {
     if (!app_cfg.app_port) {
         rte_exit(EXIT_FAILURE, "There is no app port initialized.\n");
     }
-    app_cfg.app_port->ip_addr  = 254; app_cfg.app_port->ip_addr <<= 8;
-    app_cfg.app_port->ip_addr |= 1;   app_cfg.app_port->ip_addr <<= 8;
+    app_cfg.app_port->ip_addr  = 192; app_cfg.app_port->ip_addr <<= 8;
     app_cfg.app_port->ip_addr |= 168; app_cfg.app_port->ip_addr <<= 8;
-    app_cfg.app_port->ip_addr |= 192;
+    app_cfg.app_port->ip_addr |= 1;   app_cfg.app_port->ip_addr <<= 8;
+    app_cfg.app_port->ip_addr |= 254;
 
     rte_spinlock_init(&app_cfg.tx_lock);
 
