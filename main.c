@@ -21,6 +21,7 @@
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
+#include <rte_spinlock.h>
 
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
@@ -38,6 +39,7 @@ typedef struct {
 typedef struct {
     struct rte_mempool* mbuf_pool;
     app_port_t* app_port;
+    rte_spinlock_t tx_lock;
 } app_config_t;
 
 app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
@@ -156,6 +158,10 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
 
     RTE_LOG(INFO, USER1, "port[%hu] status: %s\n", port_id, link_status_text);
 
+    rte_delay_us_sleep(1000 * 1000);
+
+    RTE_LOG(INFO, USER1, "port[%hu] initialized\n", port_id);
+
     app_port->port_id = port_id;
     app_port->dev_socket_id = dev_socket_id;
     rte_ether_addr_copy(&mac_addr, &app_port->mac_addr);
@@ -199,11 +205,16 @@ app_second_loop(__rte_unused void *arg) {
         rte_ether_unformat_addr("FF:FF:FF:FF:FF:FF", &arp_h->arp_data.arp_tha);
         arp_h->arp_data.arp_tip = app_port->ip_addr;
 
-        if (rte_eth_tx_burst(app_port->port_id, 0, &mbuf, 1) != 1) {
-            RTE_LOG(WARNING, USER1, "Fail to send gratuitous APR\n");
-            rte_pktmbuf_free(mbuf);
-        }
-        RTE_LOG(WARNING, USER1, "Gratuitous APR sent\n");
+        rte_spinlock_lock(&app_cfg->tx_lock);
+        do {
+            if (rte_eth_tx_burst(app_port->port_id, 0, &mbuf, 1) != 1) {
+                RTE_LOG(WARNING, USER1, "Fail to send gratuitous APR\n");
+                rte_pktmbuf_free(mbuf);
+                break;
+            }
+            RTE_LOG(WARNING, USER1, "Gratuitous APR sent\n");
+        } while (0);
+        rte_spinlock_unlock(&app_cfg->tx_lock);
 
         rte_delay_us_sleep(180 * 1000 * 1000);
     }
@@ -296,6 +307,8 @@ int main(int argc, char* argv[]) {
     app_cfg.app_port->ip_addr |= 1;   app_cfg.app_port->ip_addr <<= 8;
     app_cfg.app_port->ip_addr |= 168; app_cfg.app_port->ip_addr <<= 8;
     app_cfg.app_port->ip_addr |= 192;
+
+    rte_spinlock_init(&app_cfg.tx_lock);
 
     lcore_id = rte_get_next_lcore(-1, 1, 0);
     rc = rte_eal_remote_launch(app_second_loop, &app_cfg, lcore_id);
