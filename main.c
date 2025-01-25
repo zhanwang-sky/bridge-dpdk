@@ -64,12 +64,6 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
                   port_id, rte_strerror(-rc));
     }
 
-    rc = rte_eth_macaddr_get(port_id, &mac_addr);
-    if (rc < 0) {
-        rte_panic("Fail to get mac addr: port %hu, %s\n",
-                  port_id, rte_strerror(-rc));
-    }
-
     RTE_LOG(INFO, USER1,
             "port[%hu] info:\n---\n"
             "name: %s\n"
@@ -84,7 +78,6 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
             "max_tx_descs: %hu\n"
             "rx_offload_capa: %08lx\n"
             "tx_offload_capa: %08lx\n"
-            "MAC: " RTE_ETHER_ADDR_PRT_FMT "\n"
             "===\n",
             port_id,
             rte_dev_name(dev_info.device),
@@ -98,8 +91,7 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
             dev_info.rx_desc_lim.nb_max,
             dev_info.tx_desc_lim.nb_max,
             dev_info.rx_offload_capa,
-            dev_info.tx_offload_capa,
-            RTE_ETHER_ADDR_BYTES(&mac_addr));
+            dev_info.tx_offload_capa);
 
     memset(&eth_cfg, 0, sizeof(eth_cfg));
     rc = rte_eth_dev_configure(port_id, 1, 1, &eth_cfg);
@@ -135,6 +127,15 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
         rte_panic("Fail to start eth dev: port %hu, %s\n",
                   port_id, rte_strerror(-rc));
     }
+
+    rc = rte_eth_macaddr_get(port_id, &mac_addr);
+    if (rc < 0) {
+        rte_panic("Fail to get mac addr: port %hu, %s\n",
+                  port_id, rte_strerror(-rc));
+    }
+
+    RTE_LOG(INFO, USER1, "port[%hu] MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
+            port_id, RTE_ETHER_ADDR_BYTES(&mac_addr));
 
     app_port->port_id = port_id;
     app_port->dev_socket_id = dev_socket_id;
