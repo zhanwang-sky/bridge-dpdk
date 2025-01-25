@@ -10,12 +10,14 @@
 
 #include <unistd.h>
 
+#include <rte_arp.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_debug.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
+#include <rte_ether.h>
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_malloc.h>
@@ -30,6 +32,7 @@ typedef struct {
     uint16_t port_id;
     int dev_socket_id;
     struct rte_ether_addr mac_addr;
+    rte_be32_t ip_addr;
 } app_port_t;
 
 typedef struct {
@@ -146,12 +149,47 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
 
 static int
 app_second_loop(__rte_unused void *arg) {
+    app_config_t* app_cfg = (app_config_t*) arg;
+    app_port_t* app_port = app_cfg->app_port;
+    struct rte_mbuf* mbuf;
+    struct rte_ether_hdr* eth_h;
+    struct rte_arp_hdr* arp_h;
+
     RTE_LOG(INFO, USER1, ">>> Launching second loop on lcore %u\n",
             rte_lcore_id());
 
     for (;;) {
-        RTE_LOG(INFO, USER1, "XXX TODO: Generate gratuitous ARP.\n");
-        sleep(180);
+        mbuf = rte_pktmbuf_alloc(app_cfg->mbuf_pool);
+        if (!mbuf) {
+            rte_panic("Fail to alloc mbuf for gratuitous APR\n");
+        }
+
+        mbuf->pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+        mbuf->data_len = mbuf->pkt_len;
+
+        eth_h = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
+        rte_ether_unformat_addr("FF:FF:FF:FF:FF:FF", &eth_h->dst_addr);
+        rte_ether_addr_copy(&app_port->mac_addr, &eth_h->src_addr);
+        eth_h->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
+
+        arp_h = rte_pktmbuf_mtod_offset(mbuf, struct rte_arp_hdr*, sizeof(struct rte_ether_hdr));
+        arp_h->arp_hardware = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+        arp_h->arp_protocol = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+        arp_h->arp_hlen = RTE_ETHER_ADDR_LEN;
+        arp_h->arp_plen = sizeof(uint32_t);
+        arp_h->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REQUEST);
+        rte_ether_addr_copy(&app_port->mac_addr, &arp_h->arp_data.arp_sha);
+        arp_h->arp_data.arp_sip = app_port->ip_addr;
+        rte_ether_unformat_addr("FF:FF:FF:FF:FF:FF", &arp_h->arp_data.arp_tha);
+        arp_h->arp_data.arp_tip = app_port->ip_addr;
+
+        if (rte_eth_tx_burst(app_port->port_id, 0, &mbuf, 1) != 1) {
+            RTE_LOG(WARNING, USER1, "Fail to send gratuitous APR\n");
+            rte_pktmbuf_free(mbuf);
+        }
+        RTE_LOG(WARNING, USER1, "Gratuitous APR sent\n");
+
+        rte_delay_us_sleep(180 * 1000 * 1000);
     }
 
     return 0;
@@ -187,6 +225,8 @@ app_main_loop(void *arg) {
             prev_cycles = curr_cycles;
             pkts_per_sec = 0;
         }
+
+        rte_delay_us_sleep(1);
     }
 }
 
@@ -236,6 +276,10 @@ int main(int argc, char* argv[]) {
     if (!app_cfg.app_port) {
         rte_exit(EXIT_FAILURE, "There is no app port initialized.\n");
     }
+    app_cfg.app_port->ip_addr  = 254; app_cfg.app_port->ip_addr <<= 8;
+    app_cfg.app_port->ip_addr |= 1;   app_cfg.app_port->ip_addr <<= 8;
+    app_cfg.app_port->ip_addr |= 168; app_cfg.app_port->ip_addr <<= 8;
+    app_cfg.app_port->ip_addr |= 192;
 
     lcore_id = rte_get_next_lcore(-1, 1, 0);
     rc = rte_eal_remote_launch(app_second_loop, &app_cfg, lcore_id);
