@@ -49,6 +49,8 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     struct rte_eth_dev_info dev_info;
     struct rte_eth_conf eth_cfg;
     struct rte_ether_addr mac_addr;
+    struct rte_eth_link link;
+    char link_status_text[RTE_ETH_LINK_MAX_STR_LEN];
 
     app_port = rte_malloc("app_port_t", sizeof(app_port_t), RTE_CACHE_LINE_SIZE);
     if (!app_port) {
@@ -139,6 +141,20 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
 
     RTE_LOG(INFO, USER1, "port[%hu] MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
             port_id, RTE_ETHER_ADDR_BYTES(&mac_addr));
+
+    rc = rte_eth_link_get(port_id, &link);
+    if (rc < 0) {
+        rte_panic("Fail to get link status: port %hu, %s\n",
+                  port_id, rte_strerror(-rc));
+    }
+
+    rc = rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
+    if (rc < 0) {
+        rte_panic("Fail to convert link status to text string: port %hu, %s\n",
+                  port_id, rte_strerror(-rc));
+    }
+
+    RTE_LOG(INFO, USER1, "port[%hu] status: %s\n", port_id, link_status_text);
 
     app_port->port_id = port_id;
     app_port->dev_socket_id = dev_socket_id;
