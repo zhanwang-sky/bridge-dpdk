@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <unistd.h>
+
 #include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_debug.h>
@@ -143,6 +145,16 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     return app_port;
 }
 
+static int
+app_second_loop(__rte_unused void *arg) {
+    for (;;) {
+        RTE_LOG(INFO, USER1, "XXX TODO: Generate gratuitous ARP.\n");
+        sleep(180);
+    }
+
+    return 0;
+}
+
 static __rte_noreturn void
 app_main_loop(__rte_unused void *arg) {
     uint64_t timer_hz;
@@ -175,7 +187,9 @@ app_main_loop(__rte_unused void *arg) {
 int main(int argc, char* argv[]) {
     int rc;
     unsigned nr_lcores;
+    unsigned lcore_id;
     uint16_t nr_ports;
+    uint16_t port_id;
 
     rc = rte_eal_init(argc, argv);
     if (rc < 0) {
@@ -205,13 +219,21 @@ int main(int argc, char* argv[]) {
         rte_panic("Fail to create mempool: %s\n", rte_strerror(rte_errno));
     }
 
-    for (uint16_t i = 0; i != nr_ports; ++i) {
-        if ((app_cfg.app_port = app_port_init(i, app_cfg.mbuf_pool)) != NULL) {
+    for (port_id = 0; port_id != nr_ports; ++port_id) {
+        app_cfg.app_port = app_port_init(port_id, app_cfg.mbuf_pool);
+        if (app_cfg.app_port != NULL) {
             break;
         }
     }
     if (!app_cfg.app_port) {
         rte_exit(EXIT_FAILURE, "There is no app port initialized.\n");
+    }
+
+    lcore_id = rte_get_next_lcore(-1, 1, 0);
+    rc = rte_eal_remote_launch(app_second_loop, NULL, lcore_id);
+    if (rc < 0) {
+        rte_panic("Fail to launch second loop on lcore %u: %s\n",
+                  lcore_id, rte_strerror(-rc));
     }
 
     app_main_loop(NULL);
