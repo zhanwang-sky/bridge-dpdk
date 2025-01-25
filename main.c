@@ -37,8 +37,6 @@ typedef struct {
     app_port_t* app_port;
 } app_config_t;
 
-app_config_t app_cfg;
-
 app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     int rc;
     int dev_socket_id;
@@ -49,7 +47,7 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     struct rte_eth_conf eth_cfg;
     struct rte_ether_addr mac_addr;
 
-    app_port = rte_malloc(NULL, sizeof(*app_port), 0);
+    app_port = rte_malloc("app_port_t", sizeof(app_port_t), RTE_CACHE_LINE_SIZE);
     if (!app_port) {
         rte_panic("Fail to alloc memory for app_port\n");
     }
@@ -147,6 +145,9 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
 
 static int
 app_second_loop(__rte_unused void *arg) {
+    RTE_LOG(INFO, USER1, ">>> Launching second loop on lcore %u\n",
+            rte_lcore_id());
+
     for (;;) {
         RTE_LOG(INFO, USER1, "XXX TODO: Generate gratuitous ARP.\n");
         sleep(180);
@@ -156,7 +157,8 @@ app_second_loop(__rte_unused void *arg) {
 }
 
 static __rte_noreturn void
-app_main_loop(__rte_unused void *arg) {
+app_main_loop(void *arg) {
+    app_config_t* app_cfg = (app_config_t*) arg;
     uint64_t timer_hz;
     uint64_t prev_cycles;
     uint64_t curr_cycles;
@@ -164,12 +166,15 @@ app_main_loop(__rte_unused void *arg) {
     struct rte_mbuf* rx_pkts[BURST_SIZE];
     uint16_t nb_rx;
 
+    RTE_LOG(INFO, USER1, ">>> Launching main loop on lcore %u\n",
+            rte_lcore_id());
+
     timer_hz = rte_get_timer_hz();
     prev_cycles = rte_get_timer_cycles();
     pkts_per_sec = 0;
 
     for (;;) {
-        nb_rx = rte_eth_rx_burst(app_cfg.app_port->port_id, 0, rx_pkts, BURST_SIZE);
+        nb_rx = rte_eth_rx_burst(app_cfg->app_port->port_id, 0, rx_pkts, BURST_SIZE);
         for (uint16_t i = 0; i != nb_rx; ++i) {
             rte_pktmbuf_free(rx_pkts[i]);
         }
@@ -190,6 +195,7 @@ int main(int argc, char* argv[]) {
     unsigned lcore_id;
     uint16_t nr_ports;
     uint16_t port_id;
+    app_config_t app_cfg;
 
     rc = rte_eal_init(argc, argv);
     if (rc < 0) {
@@ -211,6 +217,7 @@ int main(int argc, char* argv[]) {
     }
     RTE_LOG(INFO, USER1, "%u lcores available\n", nr_lcores);
 
+    memset(&app_cfg, 0, sizeof(app_cfg));
     app_cfg.mbuf_pool = rte_pktmbuf_pool_create("ethdev_mbuf_pool",
                                                 NUM_MBUFS, MBUF_CACHE_SIZE,
                                                 0, RTE_MBUF_DEFAULT_BUF_SIZE,
@@ -230,13 +237,13 @@ int main(int argc, char* argv[]) {
     }
 
     lcore_id = rte_get_next_lcore(-1, 1, 0);
-    rc = rte_eal_remote_launch(app_second_loop, NULL, lcore_id);
+    rc = rte_eal_remote_launch(app_second_loop, &app_cfg, lcore_id);
     if (rc < 0) {
         rte_panic("Fail to launch second loop on lcore %u: %s\n",
                   lcore_id, rte_strerror(-rc));
     }
 
-    app_main_loop(NULL);
+    app_main_loop(&app_cfg);
 
     rc = rte_eal_cleanup();
     if (rc < 0) {
