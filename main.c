@@ -36,12 +36,12 @@ typedef struct {
 } app_port_t;
 
 typedef struct {
-    struct rte_mempool* mbuf_pool;
+    struct rte_mempool* mempool;
     app_port_t* app_port;
     rte_spinlock_t tx_lock;
 } app_config_t;
 
-app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
+app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mempool) {
     int rc;
     int dev_socket_id;
     uint16_t nb_rxd = RX_RING_SIZE;
@@ -114,7 +114,7 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
 
     rc = rte_eth_rx_queue_setup(port_id, 0, nb_rxd,
                                 dev_socket_id,
-                                NULL, mbuf_pool);
+                                NULL, mempool);
     if (rc < 0) {
         rte_panic("Fail to set rx queue: port %hu, %s\n",
                   port_id, rte_strerror(-rc));
@@ -156,10 +156,6 @@ app_port_t* app_port_init(uint16_t port_id, struct rte_mempool* mbuf_pool) {
     }
 
     RTE_LOG(INFO, USER1, "port[%hu] status: %s\n", port_id, link_status_text);
-
-    rte_delay_us_sleep(1000 * 1000);
-
-    RTE_LOG(INFO, USER1, "port[%hu] initialized\n", port_id);
 
     app_port->port_id = port_id;
     app_port->dev_socket_id = dev_socket_id;
@@ -292,8 +288,10 @@ app_second_loop(__rte_unused void *arg) {
 
     RTE_LOG(INFO, USER1, ">>> Launching second loop on lcore %u\n", rte_lcore_id());
 
+    rte_delay_us_sleep(1000 * 1000); // 1s
+
     for (;;) {
-        mbuf = rte_pktmbuf_alloc(app_cfg->mbuf_pool);
+        mbuf = rte_pktmbuf_alloc(app_cfg->mempool);
         if (!mbuf) {
             rte_panic("Fail to alloc mbuf for gratuitous APR\n");
         }
@@ -370,8 +368,6 @@ app_main_loop(void *arg) {
                 rte_pktmbuf_free(mbufs[i]);
             }
         }
-
-        // rte_delay_us_sleep(1);
     }
 }
 
@@ -404,16 +400,16 @@ int main(int argc, char* argv[]) {
     RTE_LOG(INFO, USER1, "%u lcores available\n", nr_lcores);
 
     memset(&app_cfg, 0, sizeof(app_cfg));
-    app_cfg.mbuf_pool = rte_pktmbuf_pool_create("ethdev_mbuf_pool",
+    app_cfg.mempool = rte_pktmbuf_pool_create("ethdev_mbuf_pool",
                                                 NUM_MBUFS, MBUF_CACHE_SIZE,
                                                 0, RTE_MBUF_DEFAULT_BUF_SIZE,
                                                 rte_socket_id());
-    if (!app_cfg.mbuf_pool) {
+    if (!app_cfg.mempool) {
         rte_panic("Fail to create mempool: %s\n", rte_strerror(rte_errno));
     }
 
     for (port_id = 0; port_id != nr_ports; ++port_id) {
-        app_cfg.app_port = app_port_init(port_id, app_cfg.mbuf_pool);
+        app_cfg.app_port = app_port_init(port_id, app_cfg.mempool);
         if (app_cfg.app_port != NULL) {
             break;
         }
