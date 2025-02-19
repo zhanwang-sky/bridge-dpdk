@@ -9,8 +9,6 @@ SRCS-y := main.c
 
 PKGCONF ?= pkg-config
 
-CFLAGS += -Wall -Wextra
-
 # Build using pkg-config variables if possible
 ifneq ($(shell $(PKGCONF) --exists libdpdk && echo 0),0)
 $(error "no installation of DPDK found")
